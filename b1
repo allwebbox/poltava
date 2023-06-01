@@ -1,0 +1,583 @@
+import requests
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import copy
+import time
+import random
+
+import websocket
+import csv
+import MySQLdb
+
+import mysql.connector
+from binance import Client, ThreadedWebsocketManager, ThreadedDepthCacheManager
+from futures_sign import send_signed_request, send_public_request
+from cred import KEY, SECRET
+from settings import delta_tp, enable_check_price_tp, delta_save, enable_check_price_save, X
+
+client = Client(KEY, SECRET)
+
+
+def connect_to_BD():
+    db = MySQLdb.connect(host="allsoft.mysql.tools", user="allsoft_binanceinfo", password="s-h)489kYA",
+                         database="allsoft_binanceinfo")
+    # cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor = db.cursor()
+    return cursor
+
+
+def position_toBD(symbol):
+    # ['short', -0.112, -0.09508, 40, 9423.25, 93.985, 0]
+    position = get_open_position(symbol)
+    s_l = position[0]
+    size = position[1]
+    enter_price = position[5]
+    profit = position[2]
+
+    cursor = connect_to_BD()
+    table = 'position'
+    # Проверяем, есть ли уже запись с таким символом
+    cursor.execute(f"SELECT * FROM `{table}` WHERE `symbol` = '{symbol}'")
+    result = cursor.fetchone()
+    if result:
+        # Если запись уже есть, обновляем ее
+        cursor.execute(
+            f"UPDATE `{table}` SET `s_l` = '{s_l}', `size` = '{size}', `profit` = '{profit}',  `enter_price` = '{enter_price}' WHERE `symbol` = '{symbol}'")
+    else:
+        # Если записи нет, создаем новую
+        cursor.execute(
+            f"INSERT INTO `{table}` (`symbol`, `s_l`, `size`, `profit`, `enter_price`) VALUES ('{symbol}', '{s_l}', '{size}', '{profit}', {enter_price})")
+
+    cursor.close()
+
+
+def order_tp_toBD(symbol):
+    position = get_open_position(symbol)
+    s_l = position[0]
+    size = position[1]
+    profit = position[2]
+
+    cursor = connect_to_BD()
+    table = 'position'
+    # Проверяем, есть ли уже запись с таким символом
+    cursor.execute(f"SELECT * FROM `{table}` WHERE `symbol` = '{symbol}'")
+    result = cursor.fetchone()
+    if result:
+        # Если запись уже есть, обновляем ее
+        cursor.execute(
+            f"UPDATE `{table}` SET `s_l` = '{s_l}', `size` = '{size}', `profit` = '{profit}' WHERE `symbol` = '{symbol}'")
+    else:
+        # Если записи нет, создаем новую
+        cursor.execute(
+            f"INSERT INTO `{table}` (`symbol`, `s_l`, `size`, `profit`) VALUES ('{symbol}', '{s_l}', '{size}', '{profit}')")
+
+    cursor.close()
+
+
+def getLimitOrder(symbol):
+    """
+
+    :param symbol:
+    :return: return [len(l) = Количество long  , len(s) = Количество short]
+    """
+
+    s = []
+    l = []
+    a = client.futures_get_open_orders(symbol=symbol)
+    if len(a) > 0:
+
+        df = pd.DataFrame(a)
+        for df_s_l in df['side']:
+            s_l = df_s_l
+            if s_l == 'BUY':
+                l.append(s_l)
+            if s_l == 'SELL':
+                s.append(s_l)
+        return [len(l), len(s)]
+    else:
+        return [0, 0]
+
+
+def get_open_position(symbol):
+    """
+        # Получить данные об уже открытой позиции
+        :return: Информация об открытой позиции
+   """
+    status = client.futures_account()
+    positions = pd.DataFrame(status['positions'])
+    a = positions[positions['symbol'] == symbol]['positionAmt'].astype(float).tolist()[0]
+    leverage = int(positions[positions['symbol'] == symbol]['leverage'])
+    entryPrice = positions[positions['symbol'] == symbol]['entryPrice']
+    profit = float(status['totalUnrealizedProfit'])
+    balance = round(float(status['totalWalletBalance']), 2)
+    if a > 0:
+        pos = "long"
+    elif a < 0:
+        pos = "short"
+    else:
+        pos = ""
+    return [pos, a, profit, leverage, balance, float(entryPrice), 0]
+
+
+def position_enable(symbol):
+    # 1. Проверить существует ли позиция
+    position_get = get_open_position(symbol)
+    s_l_ = position_get[0]
+    p_enable = False
+    if len(s_l_) == 0:
+        p_enable = False
+    if len(s_l_) > 0:
+        p_enable = True
+    return p_enable
+
+
+def check_and_close_orders(symbol):
+    global isStop
+    a = client.futures_get_open_orders(symbol=symbol)
+    if len(a) > 0:
+        isStop = False
+        client.futures_cancel_all_open_orders(symbol=symbol)
+
+
+def get_price_by_symbol(symbol, pr, user="root", password="", host="localhost", dbname="price", table_name="price"):
+    time.sleep(1)
+    cnx = mysql.connector.connect(user=user,
+                                  password=password,
+                                  host=host,
+                                  database=dbname)
+
+    cursor = cnx.cursor()
+    cursor.execute(f'SELECT {table_name} FROM price WHERE symbol="{symbol}"')
+    result = cursor.fetchone()
+    cnx.close()
+    if result:
+        return round(result[0], pr)
+    else:
+        return None
+
+
+def open_limit_order(symbol, s_l, quantity, qr, price, pr):
+    """
+    Открыть лимитный ордер, система выстроенная таким образом, что бы все открывалось через лимитные, ордера
+    :return:
+    """
+    price = round(price, pr)
+    quantity = round(quantity, qr)
+    batchOrder = []
+    if s_l == 'short':
+        side = 'SELL'
+    if s_l == 'long':
+        side = 'BUY'
+    a = {"symbol": symbol,
+         "side": side,
+         "type": "LIMIT",
+         "quantity": str(quantity),
+         "timeInForce": "GTC",
+         "price": str(price)}
+    batchOrder.append(a)
+    params = {"batchOrders": batchOrder}
+    print(params)
+    print(send_signed_request('POST', '/fapi/v1/batchOrders', KEY, SECRET, params))
+
+
+def open_first_position(symbol, s_l, quantity, qr, pr):
+    position_en = position_enable(symbol)
+    print(position_en)
+
+    while not position_en:
+
+        check_and_close_orders(symbol)
+        price = get_price_by_symbol(symbol, pr)
+        open_limit_order(symbol, s_l, quantity, qr, price, pr)
+        # time.sleep(1)
+        check_and_close_orders(symbol)
+        position_en = position_enable(symbol)
+        position_toBD(symbol)
+        if not position_en:
+            print(f' Не удалось создать позицию пробую снова  ')
+            continue
+
+
+def getLimitOrderCount(symbol):
+    """
+
+    :param symbol:
+    :return: return [len(l) = Количество long  , len(s) = Количество short]
+    """
+
+    s = []
+    l = []
+    a = client.futures_get_open_orders(symbol=symbol)
+    if len(a) > 0:
+
+        df = pd.DataFrame(a)
+        for df_s_l in df['side']:
+            s_l = df_s_l
+            if s_l == 'BUY':
+                l.append(s_l)
+            if s_l == 'SELL':
+                s.append(s_l)
+        return [len(l), len(s)]
+    else:
+        return [0, 0]
+
+
+def open_tp(symbol, qr, pr, delta_tp):
+    position = get_open_position(symbol)
+    enter_rice = position[5]
+    s_l = position[0]
+    quantity = round(position[1], qr)
+    OrderCountTP = 0
+    if s_l == 'long':
+        OrderCountTP = getLimitOrderCount(symbol)[1]
+    if s_l == 'short':
+        OrderCountTP = getLimitOrderCount(symbol)[0]
+
+    if OrderCountTP == 0:
+
+        if s_l == 'long':
+            price = round(enter_rice + (enter_rice * delta_tp / 100), pr)
+            print(price)
+            open_limit_order(symbol, 'short', quantity, qr, price, pr)
+
+        if s_l == 'short':
+            quantity = quantity * -1
+
+            price = round(enter_rice - (enter_rice * delta_tp / 100), pr)
+            print(price)
+            open_limit_order(symbol, 'long', quantity, qr, price, pr)
+            position_toBD(symbol)
+    else:
+        print(f'TP для {symbol} уже существует ')
+
+
+def open_save(symbol, qr, pr, delta_save, trailing_distance):
+    position = get_open_position(symbol)
+    enter_price = position[5]
+    s_l = position[0]
+    quantity = round(position[1], qr)
+    OrderCountTP = 0
+
+    if s_l == 'long':
+        OrderCountTP = getLimitOrderCount(symbol)[0]
+    if s_l == 'short':
+        OrderCountTP = getLimitOrderCount(symbol)[1]
+
+    if OrderCountTP == 0:
+        if s_l == 'long':
+            target_price = round(enter_price - (enter_price * delta_save / 100), pr)
+            stop_price = round(enter_price - (enter_price * trailing_distance / 100), pr)
+            current_price = get_price_by_symbol(symbol, pr)
+
+            if current_price >= target_price:
+                print(f"Цена приблизилась к цели {target_price}. Переустанавливаю ордер.")
+                open_limit_order(symbol, 'long', quantity, qr, current_price, pr)
+                position_toBD(symbol)
+            elif current_price <= stop_price:
+                print(f"Откат цены. Переустанавливаю ордер.")
+                open_limit_order(symbol, 'long', quantity, qr, current_price, pr)
+                position_toBD(symbol)
+
+        if s_l == 'short':
+            quantity = quantity * -1
+            target_price = round(enter_price + (enter_price * delta_save / 100), pr)
+            stop_price = round(enter_price + (enter_price * trailing_distance / 100), pr)
+            current_price = get_price_by_symbol(symbol, pr)
+
+            if current_price <= target_price:
+                print(f"Цена приблизилась к цели {target_price}. Переустанавливаю ордер.")
+                open_limit_order(symbol, 'short', quantity, qr, current_price, pr)
+                position_toBD(symbol)
+            elif current_price >= stop_price:
+                print(f"Откат цены. Переустанавливаю ордер.")
+                open_limit_order(symbol, 'short', quantity, qr, current_price, pr)
+                position_toBD(symbol)
+    else:
+        print(f'SAVE для {symbol} уже существует')
+
+
+t = 10
+
+
+def get_futures_klines(symbol, limit=20, interval='1m'):
+    x = requests.get(
+        'https://binance.com/fapi/v1/klines?symbol=' + symbol + '&limit=' + str(limit) + '&interval=' + interval)
+    df = pd.DataFrame(x.json())
+    df.columns = ['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'd1', 'd2', 'd3', 'd4', 'd5']
+    df = df.drop(['d1', 'd2', 'd3', 'd4', 'd5'], axis=1)
+    df['open'] = df['open'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['close'] = df['close'].astype(float)
+    df['volume'] = df['volume'].astype(float)
+    return df
+
+
+def get_save_price(symbol, limit, interval, pr, quantity, qr, delta_save):
+    """
+    Вернет цену для страховки
+    Цена для страховки - цена ближайшая вершина после больше или меньше
+    на заданный процент от цены входа.
+    Если текущая цена больше страховочной, добавить к delta_save
+
+    :return:
+    """
+    delta_save_last_price = 0.14
+    # l_p = last_price(symbol)
+    l_p = 1626.36
+    position = get_open_position(symbol)
+    enter_rice = position[5]
+    s_l = position[0]
+    save_priceArr = []
+    df = get_futures_klines(symbol, limit, interval)
+    print(df['close'].describe())
+    # intervalArr = [[540, 599], [480, 540], [420, 480], [360, 420]]
+    step = 10
+    tt = limit // step
+    print(tt)
+    limit = limit
+
+    intervalArr = [[limit - step * i, limit] for i in range(tt)]
+
+    del intervalArr[0]
+    print(intervalArr)
+
+    if s_l == 'long':
+        dp = round(enter_rice - (enter_rice * delta_save / 100), pr)
+        for interval_ in intervalArr:
+            low, high = interval_
+            max_high = df[low:high]['close'].min()
+
+            if max_high > dp:
+                t = (high - low) / 60
+                print(f' не найдено {t}')
+                continue
+            if max_high < dp:
+                save_priceArr.append(max_high)
+                t = (high - low) / 60
+                print(f'Найден Save цена {save_priceArr[0]} период: {t} ч')
+                break
+        print(save_priceArr)
+
+    if s_l == 'short':
+        dp = round(enter_rice + (enter_rice * delta_save / 100), pr)
+
+        for interval_ in intervalArr:
+            low, high = interval_
+            max_high = df[low:high]['close'].max()
+            # print(f' max_high {max_high} < dp {dp}')
+
+            if max_high < dp:
+                # save_priceArr.append(0)
+                continue
+            if max_high > dp:
+                save_priceArr.append(max_high)
+                t = (high - low) / 60
+                print(f'Найден Save цена {save_priceArr[0]} период: {t} ч')
+                break
+    save_priceArr = save_priceArr[0]
+    if l_p > save_priceArr:
+        if s_l == 'long':
+            save_priceArr = round(save_priceArr - (save_priceArr * delta_save_last_price / 100), pr)
+    if l_p > save_priceArr:
+        if s_l == 'short':
+            save_priceArr = round(save_priceArr + (save_priceArr * delta_save_last_price / 100), pr)
+
+    print(save_priceArr)
+    return save_priceArr
+
+
+def open_save_delta(symbol, qr, pr, delta_save):
+    position = get_open_position(symbol)
+    enter_rice = position[5]
+    s_l = position[0]
+    quantity = round(position[1], qr)
+    OrderCountTP = 0
+    if s_l == 'long':
+        OrderCountTP = getLimitOrderCount(symbol)[0]
+    if s_l == 'short':
+        OrderCountTP = getLimitOrderCount(symbol)[1]
+
+    if OrderCountTP == 0:
+         # Если цена > delta_save см контрал 7 то передвинуть !!!!!!!!!!!!!!!
+        if s_l == 'long':
+            quantity_X = quantity * X
+            price = round(enter_rice - (enter_rice * delta_save / 100), pr)
+            print(price)
+            open_limit_order(symbol, 'long', quantity_X, qr, price, pr)
+
+        if s_l == 'short':
+            quantity = quantity * -1
+            quantity_075 = (quantity / 2) + quantity
+            quantity_X = quantity * X
+            print(f'quantity_1 = {quantity_075}')
+
+            price = round(enter_rice + (enter_rice * delta_save / 100), pr)
+            print(price)
+            open_limit_order(symbol, 'short', quantity_X, qr, price, pr)
+    else:
+        print(f'SAVE для {symbol} уже существует ')
+
+
+def bot_start(symbol, s_l, quantity, qr, pr, s):
+    # Проверить существует ли позиция True / False
+    # Если позиция существует отрыть новую позицию
+    if not position_enable(symbol):
+        s = 0
+        print(f'Нет позиции {symbol}')
+        print(f'Создаю новую позицию для {symbol} {s_l} {quantity} ')
+        open_first_position(symbol, s_l, quantity, qr, pr)
+
+
+    # Если позиция не существует
+
+    else:
+
+        print(f'S = {s}')
+
+        check_and_close_orders(symbol)  # Закрыть все лимитные ордера
+        position_get = get_open_position(symbol)  #
+        get_enter_price = position_get[5]  # Получить Данные по открытой позиции
+        get_s_l = position_get[0]  #
+        tp_pr = 0.0  # Объявить переменную для цены TP
+        tp_save = 0.0  # Объявить переменную для цены TP
+        print(f' Позиция существует {position_get}')
+
+        if get_s_l == 'long':
+            tp_pr = round(get_enter_price + (get_enter_price * delta_tp / 100), pr)
+            save_pr = round(get_enter_price - (get_enter_price * delta_save[s] / 100), pr)
+
+            print(f'save_pr =  {save_pr}')
+
+            open_tp(symbol, qr, pr, delta_tp)
+            open_save_delta(symbol, qr, pr, delta_save[s])
+
+        if get_s_l == 'short':
+            tp_pr = round(get_enter_price - (get_enter_price * delta_tp / 100), pr)
+            save_pr = round(get_enter_price + (get_enter_price * delta_save[s] / 100), pr)
+
+            print(f'save_pr =  {save_pr}')
+
+            open_tp(symbol, qr, pr, delta_tp)
+            open_save_delta(symbol, qr, pr, delta_save[s])
+
+        print(f'tp_pr = {tp_pr}')
+
+        while True:
+            # if work_value == 0:
+            #     break
+            get_pr = float(get_price_by_symbol(symbol, pr, ))
+
+            if get_s_l == 'long':
+
+                enable_check_price_for_tp = round(tp_pr * (1 - enable_check_price_tp / 100), pr)
+                enable_check_price_for_save = round(save_pr * (1 + enable_check_price_save / 100), pr)
+
+
+                print(f'enable_check_price_for_save = {enable_check_price_for_save}')
+
+                if get_pr >= enable_check_price_for_tp:
+
+                    print(f'Проверить TP  \n Порог для проверки {enable_check_price_for_tp} \n текущая цена: {get_pr}')
+
+                    tp_enable = getLimitOrderCount(symbol)[1]
+                    print(f'tp_enable = {tp_enable}')
+                    if tp_enable == 1:
+                        print(f' tp установлен цена {tp_pr}')
+                    else:
+
+                        position_get = get_open_position(symbol)
+                        get_s_l = position_get[0]
+                        if len(get_s_l) == 0:
+                            break
+                        else:
+                            open_tp(symbol, qr, pr, delta_tp)
+
+                if get_pr <= enable_check_price_for_save:
+                    print(
+                        f'Проверить SAVE  \n Порог для проверки {enable_check_price_for_save} \n текущая цена: {get_pr}')
+                    tp_enable = getLimitOrderCount(symbol)[0]
+                    print(f'tp_enable = {tp_enable}')
+                    if tp_enable == 1:
+                        print(f' SAVE ЕСТЬ  установлен цена {tp_pr} s = {s}')
+
+                    else:
+                        s += 1
+
+                        check_and_close_orders(symbol)
+                        break
+
+            if get_s_l == 'short':
+
+                enable_check_price_for_tp = round(tp_pr * (1 + enable_check_price_tp / 100), pr)
+                enable_check_price_for_save = round(save_pr * (1 - enable_check_price_save / 100), pr)
+
+                if get_pr <= enable_check_price_for_tp:
+                    print(f'Проверить TP  \n Порог для проверки {enable_check_price_for_tp} \n текущая цена: {get_pr}')
+                    tp_enable = getLimitOrderCount(symbol)[0]
+                    print(f'tp_enable = {tp_enable}')
+                    if tp_enable == 1:
+                        print(f' tp установлен цена {tp_pr}')
+                    else:
+
+                        position_get = get_open_position(symbol)
+                        get_s_l = position_get[0]
+                        if len(get_s_l) == 0:
+                            s = 0
+                            check_and_close_orders(symbol)
+                            break
+                        else:
+                            open_tp(symbol, qr, pr, delta_tp)
+                print(f'enable_check_price_for_save = {enable_check_price_for_save}')
+
+                if get_pr >= enable_check_price_for_save:
+                    print(
+                        f'Проверить SAVE  \n Порог для проверки {enable_check_price_for_save} \n текущая цена: {get_pr}')
+                    tp_enable = getLimitOrderCount(symbol)[1]
+                    print(f'tp_enable = {tp_enable}')
+                    if tp_enable == 1:
+                        print(f' SAVE ЕСТЬ  установлен цена {tp_pr} s = {s}')
+
+                    else:
+                        s += 1
+
+                        check_and_close_orders(symbol)
+                        break
+
+            print(f'get_pr = {get_pr}')
+            time.sleep(1)
+
+
+############ BD ###############
+
+
+
+
+def get_work_value():
+    # Подключаемся к базе данных
+    db = MySQLdb.connect(host="localhost", user="root", password="", database="price")
+
+    # Создаем курсор для выполнения SQL-запросов
+    cursor = db.cursor()
+
+    # Выполняем SQL-запрос
+    query = "SELECT work FROM settings"
+    cursor.execute(query)
+
+    # Получаем результат запроса
+    result = cursor.fetchone()
+
+    # Закрываем соединение с базой данных
+    db.close()
+
+    # Возвращаем значение поля work
+    if result:
+        return result[0]
+    else:
+        return None
+
+
+
+
